@@ -17,7 +17,7 @@ from collections import defaultdict, OrderedDict
 from io import BytesIO, StringIO
 
 from tools.wpt import testfiles
-from testfiles import get_git_cmd
+from tools.wpt.testfiles import get_git_cmd
 from tools.browserutils.virtualenv import Virtualenv
 from tools.browserutils.utils import Kwargs
 from tools.wpt.run import run
