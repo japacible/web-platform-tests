@@ -1,31 +1,26 @@
 from __future__ import print_function
 
 import argparse
-import itertools
 import logging
 import os
-import re
-import stat
 import subprocess
 import sys
-import tarfile
-import zipfile
-from ConfigParser import RawConfigParser, SafeConfigParser
-from abc import ABCMeta, abstractmethod
-from cStringIO import StringIO as CStringIO
-from collections import defaultdict, OrderedDict
-from io import BytesIO, StringIO
+from ConfigParser import SafeConfigParser
+
+wpt_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+sys.path.insert(0, wpt_root)
 
 from tools.wpt import testfiles
 from tools.wpt.testfiles import get_git_cmd
 from tools.browserutils.virtualenv import Virtualenv
 from tools.browserutils.utils import Kwargs
-from tools.wpt.run import run
+from tools.wpt.run import create_parser, setup_wptrunner
+from tools.wpt import markdown
+from tools import localpaths
 
 logger = None
-
-wpt_root = os.path.dirname(__file__)
-
+run, write_inconsistent, write_results = None, None, None
+wptrunner = None
 
 def setup_logging():
     """Set up basic debug logger."""
@@ -34,6 +29,12 @@ def setup_logging():
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
+
+
+def do_delayed_imports():
+    global run, write_inconsistent, write_results
+    from tools.wpt.stability import run, write_inconsistent, write_results
+    from wptrunner import wptrunner
 
 
 class TravisFold(object):
@@ -170,18 +171,18 @@ def set_default_args(kwargs):
     kwargs["product"] = kwargs["product"].split(":")[0]
 
     kwargs.set_if_none("sauce_platform",
-                        default=os.environ.get("PLATFORM"))
-    kwargs.set_if_none("sauce_build_number",
-                        os.environ.get("TRAVIS_BUILD_NUMBER"))
+                       os.environ.get("PLATFORM"))
+    kwargs.set_if_none("sauce_build",
+                       os.environ.get("TRAVIS_BUILD_NUMBER"))
     python_version = os.environ.get("TRAVIS_PYTHON_VERSION")
-    kwargs.set_if_none("sauce_build_tags",
-                        [python_version] if python_version else [])
-    kwargs.set_if_none("sauce_tunnel_identifier",
+    kwargs.set_if_none("sauce_tags",
+                       [python_version] if python_version else [])
+    kwargs.set_if_none("sauce_tunnel_id",
                        os.environ.get("TRAVIS_JOB_NUMBER"))
-    kwargs.set_if_none("sauce-user",
+    kwargs.set_if_none("sauce_user",
                        os.environ.get("SAUCE_USERNAME"))
     kwargs.set_if_none("sauce_key",
-                        os.environ.get("SAUCE_ACCESS_KEY"))
+                       os.environ.get("SAUCE_ACCESS_KEY"))
 
 
 def pr():
@@ -193,9 +194,15 @@ def main():
     """Perform check_stability functionality and return exit code."""
     global logger
 
+    venv = Virtualenv(os.environ.get("VIRTUAL_ENV", os.path.join(wpt_root, "_venv")))
+    venv.install_requirements(os.path.join(wpt_root, "tools", "wptrunner", "requirements.txt"))
+    venv.install("requests")
+
     retcode = 0
     parser = get_parser()
     args, wpt_args = parser.parse_known_args()
+
+    wpt_args = create_parser().parse_args(wpt_args)
 
     with open(args.config_file, 'r') as config_fp:
         config = SafeConfigParser()
@@ -211,9 +218,7 @@ def main():
 
     setup_logging()
 
-    venv = Virtualenv(os.environ.get("VIRTUAL_ENV"))
-
-    browser_name = args.product.split(":")[0]
+    browser_name = wpt_args.product.split(":")[0]
 
     if browser_name == "sauce" and not wpt_args.sauce_key:
         logger.warning("Cannot run tests on Sauce Labs. No access key.")
@@ -222,7 +227,7 @@ def main():
     pr_number = pr()
 
     with TravisFold("browser_setup"):
-        logger.info(format_comment_title(wpt_args.product))
+        logger.info(markdown.format_comment_title(wpt_args.product))
 
         if pr is not None:
             deepen_checkout(args.user)
@@ -233,7 +238,7 @@ def main():
         head_sha1 = get_sha1()
         logger.info("Testing web-platform-tests at revision %s" % head_sha1)
 
-        branch_point = testfiles.branch_point(args.user)
+        branch_point = testfiles.branch_point()
 
         files_changed, files_ignored = testfiles.files_changed("%s..HEAD" % branch_point, ignore_changes)
 
@@ -247,12 +252,18 @@ def main():
             logger.info("No tests changed")
             return 0
 
-        wpt_kwargs =  set_default_args(vars(wpt_kwargs))
+        wpt_kwargs = Kwargs(vars(wpt_args))
+        wpt_kwargs["test_list"] = list(tests_changed | files_affected)
+        set_default_args(wpt_kwargs)
 
-        venv.install_requirements(os.path.join(wpt_root, "tools", "wptrunner", "requirements.txt"))
-        venv.install("requests")
+        do_delayed_imports()
 
-        run(venv, install=True, **wpt_kwargs)
+        wpt_kwargs["stability"] = True
+        wpt_kwargs["prompt"] = False
+        wpt_kwargs["install_browser"] = True
+        wpt_kwargs["install"] = wpt_kwargs["product"] == "firefox"
+
+        wpt_kwargs = setup_wptrunner(venv, **wpt_kwargs)
 
         try:
             version = browser.version(args.root)
@@ -260,37 +271,29 @@ def main():
             version = "unknown (error: %s)" % e
         logger.info("Using browser at version %s", version)
 
-        logger.debug("Files changed:\n%s" % "".join(" * %s\n" % item for item in files_changed))
+        if files_changed:
+            logger.debug("Files changed:\n%s" % "".join(" * %s\n" % item for item in files_changed))
 
-        tests_changed, affected_testfiles = get_affected_testfiles(files_changed, skip_tests)
+        if files_affected:
+            logger.debug("Affected tests:\n%s" % "".join(" * %s\n" % item for item in files_affected))
 
-        logger.debug("Affected tests:\n%s" % "".join(" * %s\n" % item for item in affected_testfiles))
-
-        wptrunner_files = list(itertools.chain(tests_changed, affected_testfiles))
-
-        wptrunner_kwargs = Kwargs(wptrunner_kwargs)
-
-        kwargs = wptrunner_args(args.root,
-                                wptrunner_files,
-                                args.iterations,
-                                browser)
 
     with TravisFold("running_tests"):
-        logger.info("Starting %i test iterations" % args.iterations)
+        print(wpt_kwargs["repeat"])
+        logger.info("Starting tests")
 
-        wptrunner.run_tests(**kwargs)
 
-        with open("raw.log", "rb") as log:
-            results, inconsistent = process_results(log, args.iterations)
+        wpt_logger = wptrunner.logger
+        iterations, results, inconsistent = run(venv, wpt_logger, **wpt_kwargs)
 
     if results:
         if inconsistent:
-            write_inconsistent(inconsistent, args.iterations)
+            write_inconsistent(logger.error, inconsistent, iterations)
             retcode = 2
         else:
             logger.info("All results were stable\n")
         with TravisFold("full_results"):
-            write_results(results, args.iterations, args.comment_pr)
+            write_results(logger.info, results, iterations, args.comment_pr)
     else:
         logger.info("No tests run.")
 

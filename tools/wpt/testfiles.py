@@ -3,6 +3,7 @@ import itertools
 import logging
 import os
 import subprocess
+import sys
 
 from ..manifest import manifest, update
 

@@ -104,7 +104,6 @@ class Firefox(Browser):
         return get("https://archive.mozilla.org/pub/firefox/nightly/latest-mozilla-central/%s" %
                    filename)
 
-
     def install(self, dest=None):
         """Install Firefox."""
         if dest is None:
@@ -114,8 +113,8 @@ class Firefox(Browser):
         untar(resp.raw, dest=dest)
         return os.path.join(dest, "firefox")
 
-    def find_binary(self):
-        return find_executable("firefox")
+    def find_binary(self, path=None):
+        return find_executable("firefox", path)
 
     def find_certutil(self):
         path = find_executable("certutil")
@@ -315,7 +314,7 @@ class Servo(Browser):
         """Install Servo."""
         raise NotImplementedError
 
-    def find_binary(self):
+    def find_binary(self, path=None):
         return find_executable("servo")
 
     def find_webdriver(self):
@@ -341,7 +340,7 @@ class Sauce(Browser):
         """Install Servo."""
         raise NotImplementedError
 
-    def find_binary(self):
+    def find_binary(self, path=None):
         return None
 
     def find_webdriver(self):
